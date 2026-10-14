@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -18,7 +19,7 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-3.5-flash"  # override with GEMINI_MODEL secret/env var
+DEFAULT_MODEL = "gemini-2.5-flash"  # override with GEMINI_MODEL secret/env var
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
@@ -260,6 +261,25 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+RETRY_DELAYS = (3, 6, 12)  # seconds to wait between retries on temporary errors
+
+
+def is_temporary_error(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return any(t in low for t in ("503", "unavailable", "overloaded", "high demand", "500", "internal", "504", "deadline"))
+
+
+def generate_with_retry(client, model, prompt, config):
+    """Call Gemini, retrying a few times if the model is temporarily overloaded."""
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=config)
+        except Exception as exc:
+            if attempt == len(RETRY_DELAYS) or not is_temporary_error(exc):
+                raise
+            time.sleep(RETRY_DELAYS[attempt])
+
+
 def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
     """Call Gemini and return a normalized result dict (retries once on bad JSON)."""
     checks = quick_checks(resume_text)
@@ -273,7 +293,7 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
 
     last_error = None
     for _ in range(2):
-        response = client.models.generate_content(model=model, contents=prompt, config=config)
+        response = generate_with_retry(client, model, prompt, config)
         try:
             result = normalize_result(parse_json_response(response.text))
             result["checks"] = checks
@@ -288,6 +308,8 @@ def friendly_api_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "The Gemini API key was rejected. Check that it is correct and enabled."
+    if is_temporary_error(exc):
+        return "Gemini is busy right now (temporary). Wait a minute and try again, or pick another model in the sidebar."
     if "429" in low or "quota" in low or "rate limit" in low or "resource_exhausted" in low:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
     if "404" in low or "not found" in low:
